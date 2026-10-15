@@ -7,7 +7,7 @@ let package = Package(
     products: [.executable(name: "Flozi", targets: ["Flozi"])],
     targets: [
         .target(name: "FloziCore"),
-        .executableTarget(name: "Flozi", dependencies: ["FloziCore"]),
+        .executableTarget(name: "Flozi", dependencies: ["FloziCore"], resources: [.process("Resources")]),
         .testTarget(name: "FloziCoreTests", dependencies: ["FloziCore"])
     ]
 )

@@ -1,13 +1,22 @@
 import Foundation
 
 public enum Activity: String, Sendable {
-    case working, tool, completed, interrupted, unknown
-    public var isRunning: Bool { self == .working || self == .tool }
+    case thinking, working, tool, reading, searching, coding, testing, waiting, completed, failed, interrupted, unknown
+    public var isRunning: Bool {
+        [.thinking, .working, .tool, .reading, .searching, .coding, .testing, .waiting].contains(self)
+    }
     public var label: String {
         switch self {
+        case .thinking: "Thinking"
         case .working: "Working"
         case .tool: "Using a tool"
+        case .reading: "Reading"
+        case .searching: "Searching"
+        case .coding: "Coding"
+        case .testing: "Testing"
+        case .waiting: "Waiting for you"
         case .completed: "Finished"
+        case .failed: "Needs attention"
         case .interrupted: "Interrupted"
         case .unknown: "Status unavailable"
         }
@@ -21,6 +30,7 @@ public struct Session: Identifiable, Sendable, Equatable {
     public var updated = Date.distantPast
     public var started: Date?
     public var turnID: String?
+    public var turnActive = false
     public init(id: String) { self.id = id }
 
     // Deliberately retain no prompts, outputs, tool arguments, or reasoning text.
@@ -37,26 +47,84 @@ public struct Session: Identifiable, Sendable, Equatable {
         }
         let type = payload["type"] as? String ?? ""
         let timestamp = (record["timestamp"] as? String).flatMap(Self.date) ?? updated
+        guard timestamp >= updated else { return }
         if kind == "event_msg" {
             switch type {
             case "task_started":
                 activity = .working
+                turnActive = true
                 started = timestamp
                 turnID = payload["turn_id"] as? String
             case "task_complete", "turn_aborted":
                 // A delayed completion from an older turn must not end a new turn.
                 if let ending = payload["turn_id"] as? String, let turnID, ending != turnID { return }
                 activity = type == "task_complete" ? .completed : .interrupted
+                turnActive = false
+            case "task_failed":
+                if let ending = payload["turn_id"] as? String, let turnID, ending != turnID { return }
+                activity = .failed
+                turnActive = false
+            case "item_completed" where turnActive:
+                guard let item = payload["item"] as? [String: Any] else { return }
+                if let ending = payload["turn_id"] as? String, let turnID, ending != turnID { return }
+                switch item["type"] as? String {
+                case "Reasoning": activity = .thinking
+                case "CommandExecution":
+                    let exit = item["exit_code"] as? Int ?? 0
+                    activity = exit != 0 ? .failed : Self.commandActivity(item["command"] as? String ?? "")
+                case "FileChange":
+                    activity = (item["status"] as? String)?.lowercased().contains("fail") == true ? .failed : .coding
+                case "McpToolCall": activity = Self.toolActivity(item["tool"] as? String ?? "")
+                case "ImageView": activity = .reading
+                case "Extension":
+                    activity = (item["kind"] as? String)?.lowercased().contains("search") == true ? .searching : .working
+                case "UserMessage": activity = .thinking
+                case "AgentMessage":
+                    activity = (item["questions"] as? [Any])?.isEmpty == false ? .waiting : .working
+                default: return
+                }
             default: return
             }
-        } else if kind == "response_item", activity.isRunning {
+        } else if kind == "response_item", turnActive {
             switch type {
-            case "function_call", "custom_tool_call": activity = .tool
-            case "function_call_output", "custom_tool_call_output", "message": activity = .working
+            case "reasoning": activity = .thinking
+            case "function_call", "custom_tool_call":
+                activity = Self.toolActivity(payload["name"] as? String ?? "")
+                if activity == .tool, let arguments = payload["arguments"] as? String,
+                   let data = arguments.data(using: .utf8),
+                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let cmd = parsed["cmd"] as? String { activity = Self.commandActivity(cmd) }
+            case "function_call_output", "custom_tool_call_output":
+                // Completion of a tool call is not a new reasoning event.
+                return
+            case "message": activity = .working
             default: return
             }
         } else { return }
         updated = timestamp
+    }
+
+    static func toolActivity(_ name: String) -> Activity {
+        let name = name.lowercased()
+        if name.contains("request_user_input") { return .waiting }
+        if name.contains("search") || name.contains("web__run") { return .searching }
+        if name.contains("apply_patch") || name.contains("write_file") || name.contains("edit_file") { return .coding }
+        if name.contains("read_file") || name.contains("view_image") || name.contains("fetch") { return .reading }
+        return .tool
+    }
+
+    // Only command verbs are classified, never retained or displayed. This describes
+    // last observed activity, not the current state of an underlying child process.
+    static func commandActivity(_ command: String) -> Activity {
+        let words = command.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let first = words.first ?? ""
+        if ["swift", "npm", "pnpm", "yarn", "cargo", "go", "pytest", "xcodebuild"].contains(first),
+           words.contains(where: { ["test", "tests", "pytest"].contains($0) }) || first == "pytest" { return .testing }
+        if ["rg", "grep", "find"].contains(first) { return .searching }
+        if ["cat", "sed", "head", "tail", "ls"].contains(first) { return .reading }
+        if ["swift", "npm", "pnpm", "yarn", "cargo", "xcodebuild"].contains(first),
+           words.contains("build") { return .coding }
+        return .working
     }
 
     public static func date(_ string: String) -> Date? {
@@ -128,7 +196,7 @@ public actor SessionReader {
         }
         if !selected.isEmpty && readFailures == selected.count { throw ReaderError.unreadable }
         return cursors.values.map(\.session).sorted {
-            if $0.activity.isRunning != $1.activity.isRunning { return $0.activity.isRunning }
+            if $0.turnActive != $1.turnActive { return $0.turnActive }
             return $0.updated > $1.updated
         }
     }
